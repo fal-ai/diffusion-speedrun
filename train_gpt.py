@@ -490,7 +490,7 @@ def train(
         if "lamb" in name:
             optimizer_grouped_parameters.append({"params": param, "lr": 0.01})
         else:
-            optimizer_grouped_parameters.append({"params": param, "lr": 768 / n_embed})
+            optimizer_grouped_parameters.append({"params": param, "lr": learning_rate * 768 / n_embed})
 
     optimizer = torch.optim.AdamW(
         optimizer_grouped_parameters,
