@@ -348,9 +348,9 @@ class ImageGPT(nn.Module):
             cos_local = cos[:, i : i + 1, :, :]
             sin_local = sin[:, i : i + 1, :, :]
             freq_local = (cos_local, sin_local)
-
+            v1 = None
             for j, block in enumerate(self.transformer.h):
-                x_emb, new_kv_cache = block(x_emb, kv_caches[j], freq=freq_local)
+                (x_emb, v1), new_kv_cache = block(x_emb, kv_caches[j], freq=freq_local, v1=v1)
                 kv_caches[j] = new_kv_cache
 
             x_emb = F.rms_norm(x_emb, (x_emb.size(-1),))
