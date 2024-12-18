@@ -28,6 +28,17 @@ from torch.backends.cuda import (
 )
 
 
+@dataclass
+class GPTConfig:
+    vocab_size: int = 64 * (68000 // 64)
+    n_layer: int = 12
+    n_head: int = 6
+    n_embd: int = 768
+    num_classes: int = 1000
+    wte_init_std: float = 0.02
+    v_residual: bool = False
+
+
 class ImageTokenDataset(Dataset):
     def __init__(self, safetensor_path="./imagenet_di8x8.safetensors", debug=False):
         self.safetensor_path = safetensor_path
@@ -53,6 +64,8 @@ class ImageTokenDataset(Dataset):
 
     def __getitem__(self, idx):
         indices = self.indices[idx].reshape(-1)
+        # replace randomly with 1000
+        indices = indices.masked_fill_(torch.rand((indices.shape)) < 0.05, 1000)
         class_label = self.labels[idx]
 
         return {"input_ids": indices, "class_label": class_label}
@@ -75,10 +88,14 @@ class Rotary(torch.nn.Module):
 
         self.register_buffer("freqs_hw_cos", freqs_hw.cos())
         self.register_buffer("freqs_hw_sin", freqs_hw.sin())
+        self.cache_cos = None
+        self.cache_sin = None
 
     def forward(
         self, x, height_width=None, extend_with_register_tokens=0, augment=False
     ):
+        if self.cache_cos is not None and self.cache_sin is not None:
+            return self.cache_cos, self.cache_sin
 
         if height_width is not None:
             this_h, this_w = height_width
@@ -119,7 +136,10 @@ class Rotary(torch.nn.Module):
                 0,
             )
 
-        return cos[None, :, None, :], sin[None, :, None, :]  # 1, T, 1, D
+        self.cache_cos = cos[None, :, None, :]
+        self.cache_sin = sin[None, :, None, :]
+
+        return self.cache_cos, self.cache_sin  # 1, T, 1, D
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -146,8 +166,12 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_()
 
-        self.lamb1 = nn.Parameter(torch.tensor(0.5))
-        self.lamb2 = nn.Parameter(torch.tensor(0.5))
+        if config.v_residual:
+            self.lamb1 = nn.Parameter(torch.tensor(0.5))
+            self.lamb2 = nn.Parameter(torch.tensor(0.5))
+        else:
+            self.lamb1 = 1.0
+            self.lamb2 = 0.0
 
     def forward(self, x, kv_cache=None, freq=None, v1=None):
         B, T, C = x.size()  # if this is sampling, T would be 1.
@@ -226,40 +250,6 @@ class Block(nn.Module):
         return (x, v1), new_kv_cache
 
 
-@dataclass
-class GPTConfig:
-    vocab_size: int = 64 * (68000 // 64)
-    n_layer: int = 12
-    n_head: int = 6
-    n_embd: int = 768
-    num_classes: int = 1000
-    init_wte_with_low_rank_zero: bool = False
-
-
-class LowRankZeroEmbedding(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.embedding = nn.Embedding(
-            config.vocab_size + config.num_classes, config.n_embd
-        )
-        # init zero
-        self.embedding.weight.data.zero_()
-        self.low_rank_embedding_A = nn.Embedding(
-            config.vocab_size + config.num_classes, 16
-        )
-        self.low_rank_embedding_B = nn.Linear(16, config.n_embd, bias=False)
-
-        # initialize both to very small value
-        self.low_rank_embedding_A.weight.data.normal_(mean=0.0, std=0.1)
-        self.low_rank_embedding_B.weight.data.normal_(mean=0.0, std=0.1)
-
-    def forward(self, tok):
-        x = self.embedding(tok) + self.low_rank_embedding_B(
-            self.low_rank_embedding_A(tok)
-        )
-        return x
-
-
 class ImageGPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -267,36 +257,21 @@ class ImageGPT(nn.Module):
 
         self.transformer = nn.ModuleDict(
             dict(
-                wte=(
-                    nn.Embedding(config.vocab_size + config.num_classes, config.n_embd)
-                    if not config.init_wte_with_low_rank_zero
-                    else LowRankZeroEmbedding(config)
-                ),
+                wte=nn.Embedding(config.vocab_size + config.num_classes, config.n_embd),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_()
         self.rotary = Rotary(config.n_embd // (2 * config.n_head))
-        # init wte with small random values
-        if not config.init_wte_with_low_rank_zero:
-            self.transformer.wte.weight.data.normal_(mean=0.0, std=0.02)
+        self.transformer.wte.weight.data.normal_(mean=0.0, std=config.wte_init_std)
 
     def forward(self, token_indices, class_labels):
         b, t = token_indices.size()
-
-        # randomly replace some of the class tokens with 1000.
-
-        sel_index = torch.rand((b,)) < 0.05
-        class_labels[sel_index] = 1000
-
         class_tokens = class_labels + 65536
-
         targets = token_indices
         token_indices = token_indices[:, :-1]
         token_sequence = torch.cat([class_tokens.unsqueeze(1), token_indices], dim=1)
-
-        assert token_sequence.shape == targets.shape
 
         freq = self.rotary(None, height_width=(32, 32))
 
@@ -304,7 +279,6 @@ class ImageGPT(nn.Module):
 
         # add first element to all of the embedding
         x = x + x[:, 0:1, :]
-
         x = F.rms_norm(x, (x.size(-1),))
 
         v1 = None
@@ -350,7 +324,9 @@ class ImageGPT(nn.Module):
             freq_local = (cos_local, sin_local)
             v1 = None
             for j, block in enumerate(self.transformer.h):
-                (x_emb, v1), new_kv_cache = block(x_emb, kv_caches[j], freq=freq_local, v1=v1)
+                (x_emb, v1), new_kv_cache = block(
+                    x_emb, kv_caches[j], freq=freq_local, v1=v1
+                )
                 kv_caches[j] = new_kv_cache
 
             x_emb = F.rms_norm(x_emb, (x_emb.size(-1),))
@@ -360,7 +336,7 @@ class ImageGPT(nn.Module):
             logits_cond = logits[:b, :]
             logits_uncond = logits[b:, :]
 
-            logits = logits_uncond + 7.0 * (logits_cond - logits_uncond)
+            logits = logits_uncond + 5.0 * (logits_cond - logits_uncond)
             logits = logits / temperature
 
             if top_k is not None:
@@ -388,18 +364,20 @@ class ImageGPT(nn.Module):
     help="Path to validation data",
 )
 @click.option(
-    "--global_batch_size", default=128, help="Global batch size across all GPUs"
+    "--global_batch_size", default=16 * 8, help="Global batch size across all GPUs"
 )
 @click.option("--per_gpu_batch_size", default=16, help="Per GPU batch size")
-@click.option("--num_iterations", default=100000, help="Number of training iterations")
+@click.option("--num_iterations", default=6004, help="Number of training iterations")
 @click.option("--learning_rate", default=1e-3, help="Learning rate")
 @click.option("--weight_decay", default=0.1, help="Weight decay")
 @click.option("--warmup_iters", default=10, help="Warmup iterations")
-@click.option("--warmdown_iters", default=30000, help="Warmdown iterations")
+@click.option("--warmdown_iters", default=2000, help="Warmdown iterations")
 @click.option("--val_every", default=500, help="Validation frequency")
 @click.option("--save_every", default=1000, help="Checkpoint save frequency")
-@click.option("--n_embed", default=2048, help="Embedding dimension")
+@click.option("--n_embed", default=768, help="Embedding dimension")
 @click.option("--init_ckpt", default=None, help="Path to initial checkpoint")
+@click.option("--vres", default=False, help="Use vres")
+@click.option("--n_layer", default=24, help="Number of layers")
 def train(
     run_name,
     train_data,
@@ -415,6 +393,8 @@ def train(
     save_every,
     n_embed,
     init_ckpt,
+    vres,
+    n_layer,
 ):
     dist.init_process_group(backend="nccl")
     ddp_rank = int(os.environ["RANK"])
@@ -432,6 +412,32 @@ def train(
     grad_accum_steps = int(global_batch_size // (per_gpu_batch_size * ddp_world_size))
     date_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_id = f"{date_time}_{run_name}"
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    model = ImageGPT(
+        GPTConfig(n_layer=n_layer, n_head=6, n_embd=n_embed, v_residual=vres)
+    )
+    model = model.to(device)
+
+    if init_ckpt is not None:
+        print(f"Loading checkpoint from {init_ckpt}")
+        checkpoint = torch.load(init_ckpt, map_location="cpu")
+        model.load_state_dict(checkpoint["model"])
+
+    random_tensor = torch.ones(1000, 1000).to(device) * ddp_rank
+    dist.all_reduce(random_tensor, op=dist.ReduceOp.SUM)
+    print(f"Rank {ddp_rank} has value {random_tensor[0, 0].item()}")
+
+    model = DDP(model, device_ids=[ddp_local_rank])
+    # if hasattr(config, "coordinate_descent_tuning"):
+    #     config.coordinate_descent_tuning = True # suggested by @Chillee
+
+    # model = torch.compile(model, mode="reduce-overhead")
+
+    num_params = sum(p.numel() for p in model.parameters())
+
     if master_process:
         print(f"Global batch size: {global_batch_size}")
         print(f"Per GPU batch size: {per_gpu_batch_size}")
@@ -453,26 +459,12 @@ def train(
                 "warmup_iters": warmup_iters,
                 "warmdown_iters": warmdown_iters,
                 "n_embed": n_embed,
+                "num_params": num_params,
+                "vres": vres,
             },
         )
 
         wandb.run.log_code(".")
-
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    model = ImageGPT(GPTConfig(n_layer=12, n_head=16, n_embd=n_embed))
-    model = model.to(device)
-
-    if init_ckpt is not None:
-        print(f"Loading checkpoint from {init_ckpt}")
-        checkpoint = torch.load(init_ckpt, map_location="cpu")
-        model.load_state_dict(checkpoint["model"])
-
-    random_tensor = torch.ones(1000, 1000).to(device) * ddp_rank
-    dist.all_reduce(random_tensor, op=dist.ReduceOp.SUM)
-    print(f"Rank {ddp_rank} has value {random_tensor[0, 0].item()}")
-
-    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=False)
 
     ### CONFIGURE OPTIMIZER muP way.
     # wte have higher lr.
@@ -488,9 +480,13 @@ def train(
 
     for name, param in model.module.transformer.h.named_parameters():
         if "lamb" in name:
-            optimizer_grouped_parameters.append({"params": param, "lr": 0.01})
+            optimizer_grouped_parameters.append(
+                {"params": param, "lr": 0.01, "weight_decay": 0.0}
+            )
         else:
-            optimizer_grouped_parameters.append({"params": param, "lr": learning_rate * 768 / n_embed})
+            optimizer_grouped_parameters.append(
+                {"params": param, "lr": learning_rate * 768 / n_embed}
+            )
 
     optimizer = torch.optim.AdamW(
         optimizer_grouped_parameters,
@@ -499,10 +495,10 @@ def train(
         fused=True,
     )
 
-    enable_cudnn_sdp(True)
-    enable_flash_sdp(False)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    # enable_cudnn_sdp(True)
+    enable_flash_sdp(True)
+    # enable_mem_efficient_sdp(False)
+    # enable_math_sdp(False)
 
     print(
         f"warmup_iters: {warmup_iters}, num_iterations: {num_iterations}, warmdown_iters: {warmdown_iters}, learning_rate: {learning_rate}"
@@ -533,15 +529,16 @@ def train(
         train_dataset,
         batch_size=per_gpu_batch_size,
         sampler=train_sampler,
-        num_workers=8,
+        num_workers=16,
         pin_memory=True,
         drop_last=False,
         persistent_workers=True,
+        prefetch_factor=4,
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=4,
+        batch_size=per_gpu_batch_size,
         sampler=val_sampler,
         num_workers=8,
         pin_memory=True,
@@ -565,19 +562,18 @@ def train(
                 train_iter = iter(train_loader)
                 batch = next(train_iter)
 
-            batch = {
-                k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-                for k, v in batch.items()
-            }
+            # batch = {
+            #     k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            #     for k, v in batch.items()
+            # }
 
             with ctx:
                 logits, loss = model(batch["input_ids"], batch["class_label"])
-                loss = loss / grad_accum_steps
 
             loss.backward()
 
         optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad()
         scheduler.step()
 
         if master_process and step % 1 == 0:
@@ -591,20 +587,21 @@ def train(
 
             with torch.no_grad():
                 for val_batch in val_loader:
-                    val_batch = {
-                        k: (
-                            v.to(device, non_blocking=True)
-                            if isinstance(v, torch.Tensor)
-                            else v
-                        )
-                        for k, v in val_batch.items()
-                    }
+                    # val_batch = {
+                    #     k: (
+                    #         v.to(device, non_blocking=True)
+                    #         if isinstance(v, torch.Tensor)
+                    #         else v
+                    #     )
+                    #     for k, v in val_batch.items()
+                    # }
 
                     with ctx:
                         _, val_loss = model(
                             val_batch["input_ids"], val_batch["class_label"]
                         )
-                    val_losses.append(val_loss.item())
+
+                    val_losses.append(val_loss.clone().item())
 
                     break
 

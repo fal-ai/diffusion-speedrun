@@ -10,10 +10,12 @@ from cosmos_tokenizer.image_lib import ImageTokenizer
 @click.command()
 @click.option("--checkpoint", required=True, help="Path to model checkpoint")
 @click.option("--num_samples", default=5, help="Number of samples to generate")
-@click.option("--temperature", default=0.7, help="Sampling temperature")
+@click.option("--temperature", default=0.9, help="Sampling temperature")
 @click.option("--top_k", default=100, help="Top-k sampling parameter")
 @click.option(
-    "--class_ids", default="1,130", help="Comma-separated list of class IDs to generate"
+    "--class_ids",
+    default="1,130,933,833",
+    help="Comma-separated list of class IDs to generate",
 )
 @click.option(
     "--output_dir",
