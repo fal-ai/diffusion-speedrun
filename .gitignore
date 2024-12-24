@@ -8,3 +8,11 @@ pretrained_ckpts
 preprocessed_dataset
 wandb
 logs
+*.pkl
+*.pt
+tokenize_dataset/*
+inet/**
+cosmos_ckpt/**
+wandb/**
+*.jpg
+*.jpeg
