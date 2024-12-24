@@ -4,7 +4,7 @@ from train_gpt import ImageGPT, GPTConfig
 import numpy as np
 from PIL import Image
 import os
-from cosmos_tokenizer.image_lib import ImageTokenizer
+from cosmos.image_lib import ImageTokenizer
 
 
 @click.command()
