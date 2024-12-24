@@ -5,9 +5,10 @@ import glob
 import time
 import click
 import wandb
+import math
 from dataclasses import dataclass
 import random
-
+import time
 import numpy as np
 import torch
 from torch import nn
@@ -31,13 +32,15 @@ from torch.backends.cuda import (
 
 @dataclass
 class GPTConfig:
-    vocab_size: int = 64 * (68000 // 64)
+    vocab_size: int = 16
     n_layer: int = 12
     n_head: int = 6
     n_embd: int = 768
     num_classes: int = 1000
     wte_init_std: float = 0.02
     v_residual: bool = False
+    tokenizer_type: str = "discrete"
+    patch_size: int = 2
 
 
 class ImageTokenDataset(Dataset):
@@ -48,28 +51,41 @@ class ImageTokenDataset(Dataset):
         with open(metadata_path, "r") as f:
             self.metadata = json.load(f)
             self.total_samples = self.metadata["total_samples"]
+            self.tokenizer_type = self.metadata.get("tokenizer_type", "discrete")
 
         if debug:
             self.total_samples = 10
 
-        with safe_open(safetensor_path, framework="pt") as f:
-            self.indices = f.get_tensor("indices").to(torch.uint16).long()
+        with safe_open(self.safetensor_path, framework="pt") as f:
+            if self.tokenizer_type == "continuous":
+                self.data = f.get_tensor("latents")
+            else:
+                self.data = f.get_tensor("indices").to(torch.uint16).long()
+
             self.labels = f.get_tensor("labels").long()
 
         if debug:
-            self.indices = self.indices[:10]
+            self.data = self.data[:10]
             self.labels = self.labels[:10]
 
     def __len__(self):
         return int(self.total_samples)
 
     def __getitem__(self, idx):
-        indices = self.indices[idx].reshape(-1)
-        # replace randomly with 1000
-        indices = indices.masked_fill_(torch.rand((indices.shape)) < 0.05, 1000)
-        class_label = self.labels[idx]
 
-        return {"input_ids": indices, "class_label": class_label}
+        if self.tokenizer_type == "discrete":
+            indices = self.data[idx].reshape(-1)
+            # replace randomly with 1000
+            indices = indices.masked_fill_(torch.rand((indices.shape)) < 0.05, 1000)
+            class_label = self.labels[idx]
+
+            return {"input_ids": indices, "class_label": class_label}
+
+        else:
+            return {
+                "data": self.data[idx].to(torch.bfloat16) / 39.5,
+                "label": self.labels[idx],
+            }
 
 
 class Rotary(torch.nn.Module):
@@ -154,7 +170,7 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3).type_as(x)
 
 
-class CausalSelfAttention(nn.Module):
+class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_head = config.n_head
@@ -173,6 +189,8 @@ class CausalSelfAttention(nn.Module):
         else:
             self.lamb1 = 1.0
             self.lamb2 = 0.0
+
+        self.is_causal = config.tokenizer_type == "discrete"
 
     def forward(self, x, kv_cache=None, freq=None, v1=None):
         B, T, C = x.size()  # if this is sampling, T would be 1.
@@ -205,7 +223,10 @@ class CausalSelfAttention(nn.Module):
 
             # do classic attention.
             y = F.scaled_dot_product_attention(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                is_causal=self.is_causal,
             )
 
         else:
@@ -214,7 +235,10 @@ class CausalSelfAttention(nn.Module):
             q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
             new_kv_cache = None
             y = F.scaled_dot_product_attention(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                is_causal=self.is_causal,
             )
 
         y = y.transpose(1, 2).contiguous().view_as(x)
@@ -239,7 +263,7 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config)
+        self.attn = Attention(config)
         self.mlp = MLP(config)
 
     def forward(self, x, kv_cache=None, freq=None, v1=None):
@@ -251,36 +275,119 @@ class Block(nn.Module):
         return (x, v1), new_kv_cache
 
 
-class ImageGPT(nn.Module):
+def timestep_embedding(t, dim, max_period=10000):
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period)
+        * torch.arange(start=0, end=half, dtype=torch.float32)
+        / half
+    ).to(device=t.device)
+    args = t[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+    return embedding
+
+
+class PatchEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.patch_size = config.patch_size
+        self.patch_embedding = nn.Conv2d(
+            config.vocab_size,
+            config.n_embd,
+            kernel_size=config.patch_size,
+            stride=config.patch_size,
+        )
+        self.class_embedding = nn.Embedding(config.num_classes, config.n_embd)
+
+    def forward(self, x, class_label):
+        x = self.patch_embedding(x)  # b, h, h/2, w/2
+        x = x.flatten(2).transpose(1, 2)  # b, h*w/4, n_embd
+        # print(x.shape)
+        class_embedding = self.class_embedding(class_label).unsqueeze(1).repeat(1, 8, 1)
+
+        x = torch.cat([class_embedding, x], dim=1)
+        return x
+
+
+class ImageTransformer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.tokenizer_type = config.tokenizer_type
 
         self.transformer = nn.ModuleDict(
             dict(
-                wte=nn.Embedding(config.vocab_size + config.num_classes, config.n_embd),
+                wte=(
+                    nn.Embedding(config.vocab_size + config.num_classes, config.n_embd)
+                    if self.tokenizer_type == "discrete"
+                    else PatchEmbedding(config)
+                ),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             )
         )
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        if self.tokenizer_type == "discrete":
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        else:
+            self.lm_head = nn.Linear(
+                config.n_embd,
+                config.vocab_size * config.patch_size * config.patch_size,
+                bias=True,
+            )
+
         self.lm_head.weight.data.zero_()
         self.rotary = Rotary(config.n_embd // (2 * config.n_head))
-        self.transformer.wte.weight.data.normal_(mean=0.0, std=config.wte_init_std)
+        if self.tokenizer_type == "discrete":
+            self.transformer.wte.weight.data.normal_(mean=0.0, std=config.wte_init_std)
+        else:
+            self.transformer.wte.patch_embedding.weight.data.normal_(
+                mean=0.0, std=config.wte_init_std
+            )
+            self.transformer.wte.class_embedding.weight.data.normal_(
+                mean=0.0, std=config.wte_init_std
+            )
 
-    def forward(self, token_indices, class_labels):
-        b, t = token_indices.size()
-        class_tokens = class_labels + 65536
-        targets = token_indices
-        token_indices = token_indices[:, :-1]
-        token_sequence = torch.cat([class_tokens.unsqueeze(1), token_indices], dim=1)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd),
+            nn.SiLU(),
+            nn.Linear(config.n_embd, config.n_embd),
+        )
 
-        freq = self.rotary(None, height_width=(32, 32))
+    def forward(self, batch):
 
-        x = self.transformer.wte(token_sequence)
+        if self.tokenizer_type == "discrete":
+            token_indices, class_labels = batch["input_ids"], batch["class_label"]
+            b, t = token_indices.size()
+            class_tokens = class_labels + 65536
+            targets = token_indices
+            token_indices = token_indices[:, :-1]
+            freq = self.rotary(None, height_width=(32, 32))
+            token_sequence = torch.cat(
+                [class_tokens.unsqueeze(1), token_indices], dim=1
+            )
+            x = self.transformer.wte(token_sequence)
+            # add first element to all of the embedding
+            x = x + x[:, 0:1, :]
+            x = F.rms_norm(x, (x.size(-1),))
 
-        # add first element to all of the embedding
-        x = x + x[:, 0:1, :]
-        x = F.rms_norm(x, (x.size(-1),))
+        else:
+            data, class_labels = batch["data"], batch["label"]
+            class_tokens = class_labels
+            b, c, h, w = data.size()
+            noise = torch.randn_like(data)
+            t = torch.randn((b,), device=data.device).sigmoid().bfloat16()
+            input_image = torch.lerp(data, noise, t.reshape(b, 1, 1, 1))
+            target = data - noise
+            x = self.transformer.wte(input_image, class_tokens)
+            freq = self.rotary(
+                None, height_width=(h // 2, w // 2), extend_with_register_tokens=16
+            )
+
+            temb = timestep_embedding(t * 1000, self.config.n_embd)
+            temb = self.time_mlp(temb)
+            x = torch.cat([temb.reshape(b, 1, -1).repeat(1, 8, 1), x], dim=1)
+            x = F.rms_norm(x, (x.size(-1),))
 
         v1 = None
         for block in self.transformer.h:
@@ -288,17 +395,25 @@ class ImageGPT(nn.Module):
 
         x = F.rms_norm(x, (x.size(-1),))
 
-        logits = self.lm_head(x)
-        logits = logits.float()
+        logits = self.lm_head(x).float()
 
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-        )
+        if self.tokenizer_type == "discrete":
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+            )
+
+        else:
+            logits = self.lm_head(x[:, 16:, :])  # b, h * w / ps * ps, 16 * ps * ps
+            logits = logits.transpose(1, 2).reshape(b, c, 2, 2, h // 2, w // 2)
+            logits = logits.permute(0, 1, 4, 2, 5, 3)
+            logits = logits.reshape(b, c, h, w)
+
+            loss = F.mse_loss(logits, target)
 
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, class_labels, max_tokens=1024, temperature=1.0, top_k=None):
+    def generate_gpt(self, class_labels, max_tokens=1024, temperature=1.0, top_k=None):
         b = class_labels.size(0)
         device = class_labels.device
 
@@ -351,31 +466,35 @@ class ImageGPT(nn.Module):
 
         return x_all[:, 1:]
 
+    @torch.no_grad()
+    def generate_diffusion(self, class_labels):
+        pass
+
 
 @click.command()
 @click.option("--run_name", default="run_1", help="Name of the run")
 @click.option(
     "--train_data",
-    default="./tokenize_dataset/preprocessed_dataset/imagenet_di8x8.safetensors",
+    default="./tokenize_dataset/preprocessed_dataset/imagenet_ci8x8.safetensors",
     help="Path to training data",
 )
 @click.option(
     "--val_data",
-    default="./tokenize_dataset/preprocessed_dataset/imagenet_di8x8_val.safetensors",
+    default="./tokenize_dataset/preprocessed_dataset/imagenet_ci8x8_val.safetensors",
     help="Path to validation data",
 )
 @click.option(
-    "--global_batch_size", default=32 * 8, help="Global batch size across all GPUs"
+    "--global_batch_size", default=64 * 8, help="Global batch size across all GPUs"
 )
-@click.option("--per_gpu_batch_size", default=32, help="Per GPU batch size")
+@click.option("--per_gpu_batch_size", default=64, help="Per GPU batch size")
 @click.option("--num_iterations", default=6004, help="Number of training iterations")
-@click.option("--learning_rate", default=1e-3, help="Learning rate")
+@click.option("--learning_rate", default=5e-4, help="Learning rate")
 @click.option(
-    "--learning_rate_embed", default=1e-2, help="Learning rate for embeddings"
+    "--learning_rate_embed", default=1e-3, help="Learning rate for embeddings"
 )
 @click.option("--weight_decay", default=0.1, help="Weight decay")
 @click.option("--warmup_iters", default=10, help="Warmup iterations")
-@click.option("--warmdown_iters", default=0, help="Warmdown iterations")
+@click.option("--warmdown_iters", default=1000, help="Warmdown iterations")
 @click.option("--val_every", default=500, help="Validation frequency")
 @click.option("--save_every", default=1000, help="Checkpoint save frequency")
 @click.option("--n_embed", default=768, help="Embedding dimension")
@@ -421,8 +540,15 @@ def train(
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    model = ImageGPT(
-        GPTConfig(n_layer=n_layer, n_head=6, n_embd=n_embed, v_residual=vres)
+    model = ImageTransformer(
+        GPTConfig(
+            n_layer=n_layer,
+            n_head=6,
+            n_embd=n_embed,
+            v_residual=vres,
+            tokenizer_type="continuous",
+            vocab_size=16,
+        )
     )
     model = model.to(device)
 
@@ -450,7 +576,7 @@ def train(
         print(f"Effective batch size per step: {per_gpu_batch_size * ddp_world_size}")
 
         wandb.init(
-            project="imagegpt",
+            project="image_diffusion_speedrun",
             name=run_name,
             config={
                 "train_data": train_data,
@@ -466,6 +592,10 @@ def train(
                 "n_embed": n_embed,
                 "num_params": num_params,
                 "vres": vres,
+                "n_layer": n_layer,
+                "tokenizer_type": "continuous",
+                "run_id": run_id,
+                "date_time": date_time,
             },
         )
 
@@ -539,7 +669,7 @@ def train(
         sampler=train_sampler,
         num_workers=16,
         pin_memory=True,
-        drop_last=False,
+        drop_last=True,
         persistent_workers=True,
         prefetch_factor=4,
     )
@@ -571,7 +701,7 @@ def train(
                 batch = next(train_iter)
 
             with ctx:
-                logits, loss = model(batch["input_ids"], batch["class_label"])
+                logits, loss = model(batch)
 
             loss.backward()
 
@@ -584,18 +714,17 @@ def train(
             print(f"step: {step}, loss: {loss.item():.2f}, lr: {lr:.2e}")
             wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/step": step})
 
-        if step > 0 and step % val_every == 0:
+        if step % val_every == 0:
             model.eval()
             val_losses = []
 
             with torch.no_grad():
                 for val_batch in tqdm(val_loader):
                     with ctx:
-                        _, val_loss = model(
-                            val_batch["input_ids"], val_batch["class_label"]
-                        )
+                        _, val_loss = model(val_batch)
 
                     val_losses.append(val_loss.clone().item())
+                    break
 
             val_loss = torch.tensor(np.mean(val_losses)).to(device)
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)

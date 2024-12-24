@@ -1,7 +1,7 @@
 __pycache__
 cosmos_numpy
-cosmos_discrete
-cosmos_continuous
+cosmos_discrete*
+cosmos_continuous*
 tokenize_dataset/Cosmos-Tokenizer
 pretrained_ckpts
 *.safetensors

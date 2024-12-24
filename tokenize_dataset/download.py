@@ -47,10 +47,10 @@ def download_models():
 def download_imagenet():
     """Download ImageNet dataset from HuggingFace"""
     print("Downloading ImageNet training split...")
-    train_dataset = load_dataset("imagenet-1k", split="train")
+    # train_dataset = load_dataset("imagenet-1k", split="train")
     print("Sample training images:")
-    for i in range(5):
-        print(train_dataset[i]["image"])
+    # for i in range(5):
+    #     print(train_dataset[i]["image"])
 
     print("\nDownloading ImageNet validation split...")
     val_dataset = load_dataset("imagenet-1k", split="validation")

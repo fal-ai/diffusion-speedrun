@@ -39,8 +39,10 @@ def prepare_image(pil_image, w=SIZE, h=SIZE):
 
 
 class ImageDataset(Dataset):
-    def __init__(self, idx_range=(0, 1000), is_test=False):
-        self.dataset = load_dataset("imagenet-1k", split="train")
+    def __init__(self, idx_range=(0, 1000), is_validation=False):
+        self.dataset = load_dataset(
+            "imagenet-1k", split="train" if not is_validation else "validation"
+        )
         self.idx_range = idx_range
         if self.idx_range[1] > len(self.dataset):
             self.idx_range = (self.idx_range[0], len(self.dataset))
@@ -72,7 +74,7 @@ def convert_to_numpy(
     continuous=False,
     batch_size=8,
     num_workers=4,
-    is_test=False,
+    is_validation=False,
 ):
     logging.info(
         f"Processing on {device} with {'continuous' if continuous else 'discrete'} tokenizer"
@@ -85,7 +87,7 @@ def convert_to_numpy(
         checkpoint_enc=f"pretrained_ckpts/{model_name}/encoder.jit"
     ).to(device)
 
-    dataset = ImageDataset(idx_range, is_test=is_test)
+    dataset = ImageDataset(idx_range, is_validation=is_validation)
 
     if dataset.__len__() < 1:
         logging.info("No images to process.")
@@ -195,21 +197,29 @@ def convert_to_numpy(
 
 
 def process_single_job(
-    file_index, gpu_id, continuous=False, batch_size=64, num_workers=8, is_test=False
+    file_index,
+    gpu_id,
+    continuous=False,
+    batch_size=64,
+    num_workers=8,
+    is_validation=False,
 ):
+    print(f"Single Job: Is validation: {is_validation}")
+    print(f"GPU ID: {gpu_id}")
     """Process a single file on specified GPU"""
     device = f"cuda:{gpu_id}"
-    out_root = f"./cosmos_{'continuous' if continuous else 'discrete'}/{str(file_index).zfill(5)}"
+    name = "continuous" if continuous else "discrete"
+    name = f"{name}_val" if is_validation else name
+    print(f"Processing {name} on GPU {gpu_id}, file {file_index}")
+    out_root = f"./cosmos_{name}/{str(file_index).zfill(5)}"
 
     idx_range = (file_index * 100000, (file_index + 1) * 100000)
     convert_to_numpy(
-        idx_range, out_root, device, continuous, batch_size, num_workers, is_test
+        idx_range, out_root, device, continuous, batch_size, num_workers, is_validation
     )
 
 
-def launch_multi_gpu_jobs(
-    num_gpus=None, total_files=13, continuous=False, batch_size=64
-):
+def launch_multi_gpu_jobs(num_gpus, total_files, continuous, batch_size, is_validation):
     available_gpus = torch.cuda.device_count()
     if available_gpus == 0:
         click.echo("No GPUs found!")
@@ -231,7 +241,7 @@ def launch_multi_gpu_jobs(
 
     ctx = mp.get_context("spawn")
     processes = []
-
+    print(f"Launching {num_gpus} processes, Is validation: {is_validation}")
     for gpu_id in range(num_gpus):
         start_file = gpu_id * files_per_gpu
         end_file = min((gpu_id + 1) * files_per_gpu, total_files)
@@ -239,7 +249,7 @@ def launch_multi_gpu_jobs(
         for file_idx in range(start_file, end_file):
             p = ctx.Process(
                 target=process_single_job,
-                args=(file_idx, gpu_id, continuous, batch_size),
+                args=(file_idx, gpu_id, continuous, batch_size, 8, is_validation),
             )
             processes.append((p, gpu_id, file_idx))
             p.start()
@@ -275,13 +285,36 @@ def launch_multi_gpu_jobs(
     "--file-index", type=int, default=0, help="File index for single job mode"
 )
 @click.option("--gpu-id", type=int, default=0, help="GPU ID for single job mode")
-def main(num_gpus, total_files, batch_size, continuous, single_job, file_index, gpu_id):
+@click.option("--is-validation", is_flag=True, help="Use validation mode")
+def main(
+    num_gpus,
+    total_files,
+    batch_size,
+    continuous,
+    single_job,
+    file_index,
+    gpu_id,
+    is_validation,
+):
+    print(f"Processing {is_validation} on GPU {gpu_id}, file {file_index}")
     """Multi-GPU ImageNet Processing with Cosmos Tokenizer"""
     if single_job:
-        process_single_job(file_index, gpu_id, continuous, batch_size)
+        process_single_job(
+            file_index,
+            gpu_id,
+            continuous,
+            batch_size,
+            is_validation=is_validation,
+        )
     else:
-        launch_multi_gpu_jobs(num_gpus, total_files, continuous, batch_size)
+        launch_multi_gpu_jobs(
+            num_gpus, total_files, continuous, batch_size, is_validation=is_validation
+        )
 
 
 if __name__ == "__main__":
+    # example usage:
+    # python tokenize_imagenet_numpy.py --num-gpus 8 --total-files 8 --is-validation
+    # python tokenize_imagenet_numpy.py --num-gpus 8 --total-files 8 --continuous --is-validation
+    # python tokenize_imagenet_numpy.py --num-gpus 1 --total-files 1 --batch-size 64 --continuous --single-job --file-index 0 --gpu-id 0 --is-validation
     main()

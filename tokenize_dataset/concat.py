@@ -15,12 +15,14 @@ import click
     is_flag=True,
     help="Process continuous tokenizer output instead of discrete",
 )
-def concat_shards(continuous=False):
+@click.option("--is-validation", is_flag=True, help="Use validation mode")
+def concat_shards(continuous=False, is_validation=False):
     """
     Concatenate all numpy shards into a single tensor
     Support both discrete indices and continuous latents
     """
     base_dir = "./cosmos_continuous" if continuous else "./cosmos_discrete"
+    base_dir = f"{base_dir}_val" if is_validation else base_dir
     # Get all shard directories
     shard_dirs = sorted(glob.glob(os.path.join(base_dir, "*")))
     print(f"Found {len(shard_dirs)} shard directories")
@@ -76,11 +78,11 @@ def concat_shards(continuous=False):
     # Convert to torch tensors with appropriate dtype
     if continuous:
         data_tensor = torch.from_numpy(all_data).to(torch.int8)
-        out_name = "imagenet_ci8x8"
+        out_name = "imagenet_ci8x8_val" if is_validation else "imagenet_ci8x8"
         tensor_key = "latents"
     else:
         data_tensor = torch.from_numpy(all_data).to(torch.int16)
-        out_name = "imagenet_di8x8"
+        out_name = "imagenet_di8x8_val" if is_validation else "imagenet_di8x8"
         tensor_key = "indices"
 
     labels_tensor = torch.from_numpy(all_labels).to(torch.int16)
@@ -91,6 +93,7 @@ def concat_shards(continuous=False):
         "data_shape": str(list(all_data.shape)),
         "labels_shape": str(list(all_labels.shape)),
         "tokenizer_type": "continuous" if continuous else "discrete",
+        "is_validation": str(is_validation),
     }
 
     # Save as safetensors
